@@ -1,0 +1,381 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+"""
+Generate possible conformations for small molecules for
+subsequent semi-empirical optimization.
+
+by: Lars Bratholm <larsbratholm@gmail.com>
+project: https://github.com/larsbratholm/conformer_search
+"""
+
+import sys
+import itertools
+import copy
+
+# Read gaussian z-matrix (gzmat in obabel)
+def read_zmat(filename,extensive):
+    # read file
+    with open(filename) as f:
+        lines = f.readlines()
+    # startline of header
+    header_line = None
+    # startline of variables
+    var_line = None
+
+    # figure out where the z-matrix itself is
+    for l, line in enumerate(lines):
+        # \n is the last character of each line
+        if len(line) == 2 and line[0] not in ["#"," "]:
+            header_line = l
+        elif line.startswith("Variables"):
+            var_line = l
+            break
+
+    # get a dictionary over the variable values
+    variables = {}
+    for l, line in enumerate(lines[var_line:]):
+        if "=" in line:
+            tokens = line.split("=")
+            variables[tokens[0]] = float(tokens[1])
+
+    # whitespace split z-matrix
+    z_matrix = []
+    # all covalent bonds
+    bonds = {}
+
+    # parse the actual z-matrix
+    for l, line in enumerate(lines[header_line:var_line]):
+        tokens = line.split()
+        tokens[1::2] = tuple([int(x) for x in tokens[1::2]])
+        z_matrix.append(tokens[:])
+        if l == 0:
+            continue
+
+        t1 = tokens[1]
+        if t1 not in bonds: bonds[t1] = []
+        if l+1 not in bonds: bonds[l+1] = []
+        bonds[t1].append(l+1)
+        bonds[l+1].append(t1)
+
+    # list of all atoms
+    atom_list = [None] + [x[0] for x in z_matrix] # None to make the matching of indices easier
+
+    # all rotatable bonds.
+    rotatable_bonds = \
+        [tuple(sorted([int(x[1]),int(x[3])])) for x in z_matrix[2:]]
+    unique_bonds = list(set(rotatable_bonds)) # remove multiple occurences
+
+    # for each bond, contains all atoms on each side of it.
+    # this is needed because the dihedral angles in the gzmat format isn't
+    # necessarily defined by atoms A,B,C,D where the bond defining the dihedral
+    # is between B and C with A bonded to B and not to C,D and D bonded to C and not A,B
+    # Maybe another z-matrix input would make this easier
+    bond_regions = {}
+    # information about which dihedrals are changed when rotating around a bond
+    dihedral_updates = {}
+    # changes in dihedral angle to be made
+    bond_updates = {}
+    # which bonds should not be rotated
+    pop_list = []
+
+    for b, bond in enumerate(unique_bonds):
+        b1 = bond[0]
+        b2 = bond[1]
+        bond_regions[bond] = [[],[]]
+        # detect which atoms are on either side of the bond.
+        #TODO need to detect if the atoms are connected in a ring.
+        append_iteratively([b1],[b2],bonds,bond_regions[bond])
+
+        # the only dihedrals that needs to be updated in a rotation
+        # are the ones where 2 of the 4 atoms defining the dihedral angle
+        # are on each side of the bond.
+        dihedral_updates[bond] = []
+        for i, item in enumerate(z_matrix[3:]):
+            count = 0
+            a1,a2,a3,a4 = (i+4, item[1], item[3], item[5])
+            for j in (a1,a2,a3,a4):
+                if j in bond_regions[bond][0]:
+                    count += 1
+            if count == 2:
+                # This is needs to be validated, but I "think" that
+                # if bond = a2,a3 the rotation should be in one direction, while
+                # for bond = a3,a2 the rotation should be in the opposite direction
+
+                # The sign indicates the direction
+                dihedral = (i+4,1)
+                if bond == (a3,a2):
+                    dihedral = (i+4,-1)
+                dihedral_updates[bond].append(dihedral)
+
+        # Figure out which bonds are single,double,triple from the bond- and
+        # dihedral angles as well as detect some symmetry, and return which
+        # rotations the dihedral angle should use
+        dihedrals = define_bonds(b1, b2, bonds, z_matrix, variables, atom_list, extensive)
+
+        if dihedrals == None: # sp-hybridization etc.
+            dihedral_updates.pop(bond)
+        else:
+            bond_updates[bond] = dihedrals[:]
+
+
+    # Each tetrahedral nitrogen have two conformation of the lone pair
+    # relative to the covalent bonds. These are explored by interchanging
+    # two of the covalent bonds in the z-matrix
+    lone_pair_updates = {}
+    if extensive: # this is only done in an extensive search
+        for a, atom in enumerate(atom_list):
+            # Only do this for N
+            if atom != "N":
+                continue
+
+            # Detect if N is tetrahedral with a free lone pair
+            single, double, triple = True, True, True
+            if len(bonds[a+1]) == 4:
+                continue
+            else:
+                for item in z_matrix:
+                    if len(item) >= 5:
+                        # check all angles for possible triple bonds
+                        if a+1 in [item[1],item[3]]:
+                            if v[item[4]] > 190 or v[item[4]] < 170: # assume the angle of a triple bond is between 170 and 190 degrees
+                                triple = False
+                        # check all dihedrals for possible double bonds
+                        if a+1 in [item[1],item[3]]:
+                            if (v[item[6]] > 190 or v[item[6]] < 170) and v[item[6]] < 350 and v[item[6]] > 10: # assume a double bond dihedral angle is between 170 and 190 degrees
+                                double = False
+                if triple or double:
+                    continue
+
+                neighbours = bonds[a+1]
+                unique_bonds.append(a+1)
+                lone_pair_updates[a+1] = []
+
+                # updating the dihedrals by replacing references from one neighbour
+                # atom to another
+                n1 = neighbours[0]
+                n2 = neighbours[1]
+                n3 = neighbours[2]
+                for i, item in enumerate(z_matrix):
+                    if i+1 == n1 and item[1] == a+1 and item[3] == n2:
+                        lone_pair_updates[a+1].append([i,3,n3])
+                    elif i+1 == n1 and item[1] == a+1 and item[3] == n3:
+                        lone_pair_updates[a+1].append([i,3,n2])
+                    elif i+1 == n2 and item[1] == a+1 and item[3] == n1:
+                        lone_pair_updates[a+1].append([i,3,n3])
+                    elif i+1 == n2 and item[1] == a+1 and item[3] == n3:
+                        lone_pair_updates[a+1].append([i,3,n1])
+                    elif i+1 == n3 and item[1] == a+1 and item[3] == n1:
+                        lone_pair_updates[a+1].append([i,3,n2])
+                    elif i+1 == n3 and item[1] == a+1 and item[3] == n2:
+                        lone_pair_updates[a+1].append([i,3,n1])
+                    elif item[1] == n1 and item[3] == a+1 and item[5] == n2:
+                        lone_pair_updates[a+1].append([i,5,n3])
+                    elif item[1] == n1 and item[3] == a+1 and item[5] == n3:
+                        lone_pair_updates[a+1].append([i,5,n2])
+                    elif item[1] == n2 and item[3] == a+1 and item[5] == n1:
+                        lone_pair_updates[a+1].append([i,5,n3])
+                    elif item[1] == n2 and item[3] == a+1 and item[5] == n3:
+                        lone_pair_updates[a+1].append([i,5,n1])
+                    elif item[1] == n3 and item[3] == a+1 and item[5] == n1:
+                        lone_pair_updates[a+1].append([i,5,n2])
+                    elif item[1] == n3 and item[3] == a+1 and item[5] == n2:
+                        lone_pair_updates[a+1].append([i,5,n1])
+    var = [x.split("=")[0] for x in lines[var_line:-1]]
+    return (lines[:header_line], z_matrix, var,
+            lone_pair_updates, dihedral_updates, bond_updates, variables)
+
+
+
+# Return rotations that will be generated by detecting symmetry and bond hybridization
+def define_bonds(b1,b2,bonds,z,v,a, extensive):
+    single, double, triple = True, True, True
+    if len(bonds[b1]) == 4 or len(bonds[b2]) == 4:
+        pass
+    else:
+        for item in z:
+            if len(item) >= 5:
+                # check all angles for possible triple bonds
+                if item[1] in [b1,b2] and item[3] in [b1,b2]:
+                    if v[item[4]] > 190 or v[item[4]] < 170:
+                        triple = False
+                # check all dihedrals for possible double bonds
+                if b1 in [item[1],item[3],item[5]] and b2 in [item[1],item[3],item[5]]:
+                    if (v[item[6]] > 190 or v[item[6]] < 170) and v[item[6]] < 350 and v[item[6]] > 10:
+                        double = False
+        if triple:
+            return None
+        elif double:
+            neighbours_1 = bonds[b1]
+            neighbours_2 = bonds[b2]
+            n_atoms_1 = [atom_list[x] for x in neighbours_1]
+            n_atoms_2 = [atom_list[x] for x in neighbours_2]
+            h_count_1 = sum([1 for x in n_atoms_1 if x == "H"])
+            h_count_2 = sum([1 for x in n_atoms_2 if x == "H"])
+
+            # if the bond involves N (X=NH), different conformations can be generated
+            # by rotating in 120 degree increments (60 if extensive search)
+            # TODO should be generalized for X=NY
+            if (a[b1] == "N" and h_count_1 == 1) or (a[b2] == "N" and h_count_2 == 1):
+                if extensive:
+                    return [0,60,120,180,240,300]
+                else:
+                    return [0,120,240]
+            # if there's 2 hydrogens on either side of the double bond, rotation
+            # will not give a new conformation
+            elif h_count_1 == 2 or h_count_2 == 2:
+                return None
+            else:
+                # trans -> cis vice versa.
+                return [0,180]
+
+
+    neighbours_1 = bonds[b1]
+    neighbours_2 = bonds[b2]
+    n_atoms_1 = [a[x] for x in neighbours_1]
+    n_atoms_2 = [a[x] for x in neighbours_2]
+    h_count_1 = sum([1 for x in n_atoms_1 if x == "H"])
+    h_count_2 = sum([1 for x in n_atoms_2 if x == "H"])
+
+    # methyl and amine is symmetric
+    if h_count_1 == 3 or h_count_2 == 3:
+        if extensive:
+            return [0,60]
+        else:
+            return None
+    else:
+        if extensive:
+            return [0,60,120,180,240,300]
+        else:
+            return [0,120,240]
+
+
+# theres a lot of redundant checks here that makes it hopefully not break with
+# molecules containing rings, but who knows ¯\_(ツ)_/¯
+#TODO add special cases for rings, as way too many conformations is tried
+def append_iteratively(b1_list,b2_list,bonds,br):
+
+    # keep assigning atoms to the two domains on either side of the bond
+    # until all is assigned. In rings the domain will split roughly on the opposite side
+    # of the bond in the ring.
+    new_b1_list, new_b2_list = [], []
+    for b1 in b1_list:
+        if b1 in br[0]+br[1]:
+            continue
+        else:
+            br[0].append(b1)
+            try:
+                new_b1_list.extend(bonds[b1])
+            except KeyError:
+                pass
+    for b2 in b2_list:
+        if b2 in br[0]+br[1]:
+            continue
+        else:
+            br[1].append(b2)
+            try:
+                new_b2_list.extend(bonds[b2])
+            except KeyError:
+                pass
+    if len(new_b1_list + new_b2_list) > 0:
+        append_iteratively(new_b1_list[:],new_b2_list[:],bonds,br)
+    return
+
+# write gzmat formated file
+def write_file(header, z_matrix, this_variables, var, filename):
+    with open(filename,"w") as f:
+        f.write("".join(header))
+        for line in z_matrix:
+            f.write("  ".join([str(i) for i in line])+"\n")
+        f.write(var[0])
+        for v in var[1:]:
+            f.write("%s= %3.4f\n" % (v, this_variables[v]))
+        f.write("\n")
+
+# make sure that angles are between 0 and 360 degrees
+def fix_angles(variables):
+    for v in variables.keys():
+        if v[0] != "d":
+            continue
+        while variables[v] > 360:
+            variables[v] -= 360
+        while variables[v] < 0:
+            variables[v] += 360
+
+
+#TODO add the lone pair inversion on amines
+if __name__ == "__main__":
+
+    # set to false to generate fewer conformers
+    extensive = True
+    # break if more conformers than this would be generated
+    limit = 10000
+    # check if the number of conformations generated for the test files
+    # are what should be expected
+    test = True
+
+    # read in z-matrix and parse degrees of freedom that should be explored
+    header, z_matrix, var, lone_pair, dihedral, bond, variables \
+            = read_zmat(sys.argv[1],extensive)
+
+    # count how many conformers will be generated
+    conformers = 1
+    for i in lone_pair.values() + bond.values():
+        conformers *= len(i)
+
+    # test cases
+    if test:
+        if sys.argv[1].split("/")[-1] == "1.gzmat":
+            if (extensive == True and conformers == 6*2 or
+                extensive == False and conformers == 3*1):
+                quit("test OK")
+            quit("test FAIL")
+        if sys.argv[1].split("/")[-1] == "2.gzmat":
+            # aidsy ring structure
+            if (extensive == True):
+                quit("Required feature not implemented for test")
+            elif (extensive == False):
+                quit("Required feature not implemented for test")
+            quit("test FAIL")
+        if sys.argv[1].split("/")[-1] == "3.gzmat":
+            if (extensive == True and conformers == 6*6 or
+                extensive == False and conformers == 3*3):
+                quit("test OK")
+            quit("test FAIL")
+        if sys.argv[1].split("/")[-1] == "4.gzmat":
+            if (extensive == True and conformers == 6*6*6 or
+                extensive == False and conformers == 3*3*3):
+                quit("test OK")
+            quit("test FAIL")
+        quit("Shouldn't get here")
+    if conformers > limit:
+        quit("%s conformers was to be generated, but limit is %d" % (conformers, limit))
+
+    print "%d conformers being generated" % conformers
+
+    basename = sys.argv[1].split("/")[-1].split(".")[0] + "_"
+
+    # consistency check
+    assert(sum([x != y for x,y in zip(sorted(bond.keys()),sorted(dihedral.keys()))]) == 0)
+
+    # generate all combinations of rotations
+    generator = itertools.product(*bond.values())
+    bonds = bond.keys()
+
+    # rotate initial structure and save
+    for i, change in enumerate(generator):
+        this_variables = copy.deepcopy(variables)
+        for b,c in zip(bonds,change):
+            for idx, sign in dihedral[b]:
+                v = z_matrix[idx-1][6]
+                this_variables[v] += sign * c
+
+        fix_angles(this_variables)
+        write_file(header, z_matrix, this_variables, var, basename + str(i)+".gzmat")
+
+
+
+
+
+
+
